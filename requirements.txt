@@ -1,0 +1,8 @@
+python-dotenv>=1.0,<2
+openai>=1.109,<3
+numpy>=1.26,<3
+fastapi>=0.115,<1
+PyMuPDF>=1.24,<2
+python-socks[asyncio]>=2.4,<3
+websockets>=14,<16
+uvicorn>=0.32,<1

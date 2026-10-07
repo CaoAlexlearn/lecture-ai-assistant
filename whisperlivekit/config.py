@@ -1,0 +1,390 @@
+"""Typed configuration for the WhisperLiveKit pipeline."""
+import logging
+import math
+from dataclasses import dataclass, fields
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+FUNASR_LANGUAGES = frozenset({"auto", "zh", "yue", "en", "ja", "ko"})
+
+
+def validate_pause_segmentation_seconds(value: float) -> float:
+    """Return a normalized pause threshold or raise for invalid input."""
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "pause_segmentation_seconds must be finite and non-negative."
+        ) from exc
+    if not math.isfinite(normalized) or normalized < 0:
+        raise ValueError(
+            "pause_segmentation_seconds must be finite and non-negative."
+        )
+    return normalized
+
+
+def parse_cors_origins(origins: Optional[str]) -> list[str]:
+    """Parse comma-separated CORS origins for FastAPI."""
+    if origins is None:
+        return []
+    if isinstance(origins, (list, tuple)):
+        return [str(origin).strip() for origin in origins if str(origin).strip()]
+    return [origin.strip() for origin in str(origins).split(",") if origin.strip()]
+
+
+@dataclass
+class WhisperLiveKitConfig:
+    """Single source of truth for all WhisperLiveKit configuration.
+
+    Replaces the previous dict-based parameter system in TranscriptionEngine.
+    All fields have defaults matching the prior behaviour.
+    """
+
+    # Server / global
+    host: str = "localhost"
+    port: int = 8000
+    # None = no auth; WLK_API_TOKEN env var applies when unset.
+    api_token: Optional[str] = None
+    translate_on_complete: bool = False
+    diarization: bool = False
+    punctuation_split: bool = False
+    target_language: str = ""
+    # "nllb" (in-process, CPU-friendly), "alignatt" (Alignatt4LLM sidecar
+    # over WebSocket, streaming LLM translation with attention-gated commits)
+    # "qwen-api" (DashScope chat completion API), or "mlx-llm-mt"
+    # (in-process MLX translation via mlx-lm).
+    translation_backend: str = "nllb"
+    alignatt_url: str = "ws://localhost:8765"
+    qwen_translation_model: str = "qwen3.7-flash"
+    qwen_translation_base_url: Optional[str] = None
+    qwen_translation_timeout: float = 30.0
+    mlx_llm_mt_model: str = "hy-mt2-1.8b-8bit"
+    # Simultaneous-MT variant of mlx-llm-mt: drafts over the unstable ASR tail
+    # with the AlignAtt commit policy and a compatible MLX calibration.
+    mlx_llm_mt_simultaneous: bool = False
+    mlx_llm_mt_calibration: Optional[str] = None
+    mlx_llm_mt_simul_commit: str = "paper"  # paper | mass | argmax
+    mlx_llm_mt_simul_mass_threshold: float = 0.5
+    mlx_llm_mt_simul_soft_max_s: float = 4.0
+    mlx_llm_mt_simul_hard_max_s: float = 20.0
+    alignatt_preset: Optional[str] = None
+    # quality | balanced | low; see docs/translation-alignatt.md
+    alignatt_latency: str = "balanced"
+    alignatt_context: str = ""
+    vac: bool = True
+    vac_chunk_size: float = 0.04
+    log_level: str = "DEBUG"
+    ssl_certfile: Optional[str] = None
+    ssl_keyfile: Optional[str] = None
+    forwarded_allow_ips: Optional[str] = None
+    cors_origins: str = ""
+    transcription: bool = True
+    vad: bool = True
+    pcm_input: bool = False
+    disable_punctuation_split: bool = False
+    diarization_backend: str = "sortformer"
+    sortformer_model_path: Optional[str] = None
+    backend_policy: str = "simulstreaming"
+    backend: str = "auto"
+
+    # Transcription common
+    warmup_file: Optional[str] = None
+    min_chunk_size: float = 0.1
+    # Defer ASR until this much new audio has accrued; non-finite or <= 0 disables.
+    asr_coalesce_min_s: float = 0.0
+    # None = auto: unlimited history in mode=full, 300 s in diff mode.
+    retention_seconds: Optional[float] = None
+    # REST /v1/audio/transcriptions budget; 0 = auto (max(120, 2.5x audio)).
+    rest_timeout: float = 0.0
+    max_buffered_audio: float = 30.0
+    backpressure_timeout: float = 30.0
+    model_size: str = "base"
+    model_cache_dir: Optional[str] = None
+    model_dir: Optional[str] = None
+    model_path: Optional[str] = None
+    encoder_model_path: Optional[str] = None
+    decoder_model_path: Optional[str] = None
+    lora_path: Optional[str] = None
+    lan: str = "auto"
+    direct_english_translation: bool = False
+
+    # Alibaba Cloud Model Studio / DashScope Qwen API
+    qwen_api_model: str = "qwen3-asr-flash"
+    qwen_api_base_url: Optional[str] = None
+    qwen_api_timeout: float = 60.0
+
+    # Alibaba Qwen-Audio native duplex WebSocket backend.  This is separate
+    # from qwen-api, which remains the synchronous full-snapshot HTTP path.
+    qwen_audio_streaming_model: str = "qwen-audio-3.1-asr-flash-streaming"
+    qwen_audio_streaming_url: Optional[str] = None
+    qwen_audio_semantic_punctuation: bool = True
+    qwen_audio_streaming_chunk_ms: int = 100
+    qwen_audio_streaming_debug: bool = False
+
+    # LocalAgreement-specific
+    buffer_trimming: str = "segment"
+    confidence_validation: bool = False
+    buffer_trimming_sec: float = 15.0
+
+    # SimulStreaming-specific
+    disable_fast_encoder: bool = False
+    custom_alignment_heads: Optional[str] = None
+    frame_threshold: int = 25
+    beams: int = 1
+    decoder_type: Optional[str] = None
+    audio_max_len: float = 30.0
+    audio_min_len: float = 0.0
+    cif_ckpt_path: Optional[str] = None
+    never_fire: bool = False
+    init_prompt: Optional[str] = None
+    static_init_prompt: Optional[str] = None
+    max_context_tokens: Optional[int] = None
+
+    # Diarization (diart)
+    segmentation_model: str = "pyannote/segmentation-3.0"
+    embedding_model: str = "pyannote/embedding"
+
+    # Translation
+    nllb_backend: str = "transformers"
+    nllb_size: str = "600M"
+
+    # vLLM Qwen3 backends
+    vllm_model: str = ""
+    vllm_aligner_model: str = "Qwen/Qwen3-ForcedAligner-0.6B"
+    vllm_tensor_parallel_size: int = 1
+    vllm_gpu_memory_utilization: float = 0.45
+    vllm_dtype: str = "auto"
+    vllm_max_model_len: int = 0
+    qwen3_vllm_audio_backend: str = "standard"
+    qwen3_vllm_causal_decoder_backend: str = "vllm-text"
+    qwen3_vllm_causal_attn_implementation: str = "auto"
+    qwen3_vllm_text_decoder_model: str = ""
+    qwen3_vllm_live_idle_timeout_ms: float = 50.0
+    qwen3_vllm_tower_checkpoint: str = ""
+    qwen3_vllm_left_context_sec: float = 15.0
+    qwen3_vllm_block_frames: int = 192
+    qwen3_vllm_cache_block_size: int = 0
+    qwen3_vllm_segment_max_steps: int = 150
+    qwen3_vllm_segment_min_sec: float = 0.0
+    qwen3_vllm_prompt_context_words: int = 0
+    # None keeps the deprecated WLK_QWEN3_VLLM_*_MULTIPROCESSING env fallback.
+    qwen3_vllm_live_multiprocessing: Optional[bool] = None
+    qwen3_vllm_aligner_multiprocessing: Optional[bool] = None
+    holdback_words: Optional[int] = None
+    trim_sentence_buffer: bool = True
+    qwen3_vllm_metal_audio_backend: str = "standard"
+    qwen3_vllm_metal_tower_checkpoint: str = ""
+    qwen3_vllm_metal_left_context_sec: float = 15.0
+    qwen3_vllm_metal_block_frames: int = 192
+
+    # Qwen3 streaming backend (HF Transformers, bounded-recompute cache)
+    qwen3_streaming_chunk_sec: float = 2.0
+    qwen3_streaming_left_context_sec: float = 12.0
+    qwen3_streaming_right_context_ms: int = 640
+    qwen3_streaming_segment_max_steps: int = 200
+    qwen3_streaming_segment_keep_tail_steps: int = 0
+    qwen3_streaming_hold_back_words: int = 6
+    # None = auto (2 windowed, 1 causal; see qwen3_asr_causal asr.py).
+    qwen3_streaming_stable_iterations: Optional[int] = None
+    qwen3_streaming_max_new_tokens: int = 256
+    qwen3_streaming_device: str = "auto"
+    qwen3_streaming_dtype: str = "auto"
+    qwen3_streaming_attn_implementation: str = "auto"
+    qwen3_streaming_context: str = ""
+    qwen3_streaming_prompt_context_words: int = 0
+    qwen3_streaming_audio_backend: str = "windowed"
+    qwen3_streaming_tower_checkpoint: str = ""
+    qwen3_streaming_block_frames: int = 192
+
+    # Canary backend (NeMo EncDecMultiTaskModel on LocalAgreement)
+    canary_model: str = "nvidia/canary-1b-v2"
+    canary_default_lang: str = "en"
+    canary_lid_model: str = "langid_ambernet"
+    canary_lid_min_sec: float = 2.0
+    canary_lid_min_conf: float = 0.5
+
+    # Keep new fields at the end to preserve positional dataclass construction.
+    # Pauses longer than this become stable transcript boundaries; 0 disables.
+    pause_segmentation_seconds: float = 5.0
+    # None exposes every speaker channel provided by the Sortformer checkpoint.
+    sortformer_max_speakers: Optional[int] = None
+    qwen_snapshot_debug: bool = False
+    qwen_translation_history_size: int = 3
+    qwen_translation_agreement_rounds: int = 2
+    qwen_translation_guard_units: int = 6
+    qwen_translation_divergence_rounds: int = 2
+    qwen_translation_stabilizer_debug: bool = False
+
+    def __post_init__(self):
+        for name in ("max_buffered_audio", "backpressure_timeout"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive.")
+            setattr(self, name, value)
+        if self.punctuation_split or self.disable_punctuation_split:
+            logger.warning(
+                "--punctuation-split and --disable-punctuation-split are deprecated "
+                "and have no effect. Speaker turns and --pause-segmentation-seconds "
+                "control transcript boundaries."
+            )
+        self.pause_segmentation_seconds = validate_pause_segmentation_seconds(
+            self.pause_segmentation_seconds
+        )
+        if self.translation_backend == "qwen-api":
+            if not self.qwen_translation_model:
+                raise ValueError("qwen_translation_model must not be empty.")
+            if (
+                not math.isfinite(self.qwen_translation_timeout)
+                or self.qwen_translation_timeout <= 0
+            ):
+                raise ValueError(
+                    "qwen_translation_timeout must be finite and positive."
+                )
+            if (
+                self.qwen_translation_history_size < 1
+                or self.qwen_translation_agreement_rounds < 1
+                or self.qwen_translation_history_size
+                < self.qwen_translation_agreement_rounds
+            ):
+                raise ValueError(
+                    "qwen_translation_history_size must be >= "
+                    "qwen_translation_agreement_rounds >= 1."
+                )
+            if self.qwen_translation_guard_units < 0:
+                raise ValueError(
+                    "qwen_translation_guard_units must be non-negative."
+                )
+            if self.qwen_translation_divergence_rounds < 2:
+                raise ValueError(
+                    "qwen_translation_divergence_rounds must be >= 2."
+                )
+        if self.sortformer_max_speakers is not None:
+            if (
+                isinstance(self.sortformer_max_speakers, bool)
+                or not isinstance(self.sortformer_max_speakers, int)
+                or not 1 <= self.sortformer_max_speakers <= 4
+            ):
+                raise ValueError(
+                    "sortformer_max_speakers must be an integer between 1 and 4."
+                )
+            if self.diarization_backend != "sortformer":
+                raise ValueError(
+                    "sortformer_max_speakers requires diarization_backend=sortformer."
+                )
+
+        # .en model suffix forces English for Whisper-family backends.
+        if (
+            self.backend != "funasr"
+            and self.model_size
+            and self.model_size.endswith(".en")
+        ):
+            self.lan = "en"
+
+        if self.backend_policy == "1":
+            self.backend_policy = "simulstreaming"
+        elif self.backend_policy == "2":
+            self.backend_policy = "localagreement"
+
+        if self.backend == "canary":
+            if not math.isfinite(self.canary_lid_min_sec) or self.canary_lid_min_sec < 0:
+                raise ValueError(
+                    "canary_lid_min_sec must be finite and non-negative."
+                )
+            if (
+                not math.isfinite(self.canary_lid_min_conf)
+                or not 0.0 <= self.canary_lid_min_conf <= 1.0
+            ):
+                raise ValueError(
+                    "canary_lid_min_conf must be between 0 and 1."
+                )
+
+        if self.backend == "qwen-api":
+            if self.backend_policy == "simulstreaming":
+                logger.warning(
+                    "Qwen API requires LocalAgreement; using backend_policy=localagreement."
+                )
+                self.backend_policy = "localagreement"
+            elif self.backend_policy != "localagreement":
+                raise ValueError("Qwen API requires the LocalAgreement backend policy.")
+            if not self.qwen_api_model:
+                raise ValueError("qwen_api_model must not be empty.")
+            if not math.isfinite(self.qwen_api_timeout) or self.qwen_api_timeout <= 0:
+                raise ValueError("qwen_api_timeout must be finite and positive.")
+            return
+
+        if self.backend == "qwen-audio-streaming":
+            if self.backend_policy == "simulstreaming":
+                logger.warning(
+                    "Qwen Audio streaming uses its native sentence events; "
+                    "using backend_policy=localagreement."
+                )
+                self.backend_policy = "localagreement"
+            elif self.backend_policy != "localagreement":
+                raise ValueError(
+                    "Qwen Audio streaming requires the LocalAgreement pipeline."
+                )
+            if not self.qwen_audio_streaming_model:
+                raise ValueError("qwen_audio_streaming_model must not be empty.")
+            if self.qwen_audio_streaming_url and not str(
+                self.qwen_audio_streaming_url
+            ).startswith("wss://"):
+                raise ValueError("qwen_audio_streaming_url must use wss://.")
+            if (
+                isinstance(self.qwen_audio_streaming_chunk_ms, bool)
+                or not isinstance(self.qwen_audio_streaming_chunk_ms, int)
+                or not 20 <= self.qwen_audio_streaming_chunk_ms <= 1000
+            ):
+                raise ValueError(
+                    "qwen_audio_streaming_chunk_ms must be an integer between "
+                    "20 and 1000."
+                )
+            if self.asr_coalesce_min_s:
+                logger.warning(
+                    "--asr-coalesce-min-s is ignored by qwen-audio-streaming; "
+                    "audio is sent continuously."
+                )
+                self.asr_coalesce_min_s = 0.0
+            return
+
+        if self.backend != "funasr":
+            return
+
+        if self.backend_policy == "simulstreaming":
+            logger.warning(
+                "FunASR requires LocalAgreement; using backend_policy=localagreement."
+            )
+            self.backend_policy = "localagreement"
+        elif self.backend_policy != "localagreement":
+            raise ValueError("FunASR requires the LocalAgreement backend policy.")
+
+        if self.lan not in FUNASR_LANGUAGES:
+            supported = ", ".join(sorted(FUNASR_LANGUAGES))
+            raise ValueError(f"FunASR SenseVoiceSmall supports only: {supported}.")
+        if self.direct_english_translation:
+            raise ValueError(
+                "FunASR SenseVoiceSmall does not support direct English translation."
+            )
+        if self.buffer_trimming == "sentence" and self.lan == "auto":
+            raise ValueError(
+                "FunASR sentence trimming requires an explicit language."
+            )
+
+    # ------------------------------------------------------------------
+    # Factory helpers
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_namespace(cls, ns) -> "WhisperLiveKitConfig":
+        """Create config from an argparse Namespace, ignoring unknown keys."""
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in vars(ns).items() if k in known})
+
+    @classmethod
+    def from_kwargs(cls, **kwargs) -> "WhisperLiveKitConfig":
+        """Create config from keyword arguments; warns on unknown keys."""
+        known = {f.name for f in fields(cls)}
+        unknown = set(kwargs.keys()) - known
+        if unknown:
+            logger.warning("Unknown config keys ignored: %s", unknown)
+        return cls(**{k: v for k, v in kwargs.items() if k in known})

@@ -1,0 +1,1222 @@
+import asyncio
+import logging
+import math
+import re
+import traceback
+from time import perf_counter, time
+from typing import Any, AsyncGenerator, List, Optional, Union
+
+import numpy as np
+
+from whisperlivekit.audio_input import AudioInput
+from whisperlivekit.config import validate_pause_segmentation_seconds
+from whisperlivekit.core import (
+    TranscriptionEngine,
+    online_diarization_factory,
+    online_factory,
+    online_translation_factory,
+)
+from whisperlivekit.metrics_collector import SessionMetrics
+from whisperlivekit.processing_queue import (
+    SENTINEL,
+    PipelineClosed,
+    PipelineOverloaded,
+    ProcessingQueue,
+    get_all_from_queue,
+)
+from whisperlivekit.timed_objects import (
+    ASRToken,
+    AudioStreamEvent,
+    ChangeSpeaker,
+    FrontData,
+    HypothesisTail,
+    Silence,
+    State,
+    Transcript,
+)
+from whisperlivekit.tokens_alignment import TokensAlignment, resolve_retention_seconds
+from whisperlivekit.translation_processor import close_translation, run_translation
+
+logger = logging.getLogger(__name__)
+
+MIN_DURATION_REAL_SILENCE = 5
+
+
+def resolve_coalesce_min_s(min_s: Any) -> float:
+    """Effective coalescing threshold in seconds; invalid values disable.
+
+    Deferral stops once the accrued audio reaches the threshold, so held-back
+    audio is bounded by min_s plus one chunk.
+    """
+    value = float(min_s or 0.0)
+    if not math.isfinite(value):
+        logger.warning(
+            "asr_coalesce_min_s=%s is non-finite; coalescing disabled.",
+            min_s,
+        )
+        return 0.0
+    if value < 0.0:
+        logger.warning("asr_coalesce_min_s=%s is negative; coalescing disabled.", min_s)
+        return 0.0
+    return value
+
+
+def should_defer_inference(deferred_s: float, chunk_s: float, min_s: float) -> bool:
+    """Whether to buffer this chunk instead of running process_iter()."""
+    if min_s <= 0.0:
+        return False
+    return deferred_s + chunk_s < min_s
+
+class AudioProcessor:
+    """
+    Processes audio streams for transcription and diarization.
+    Handles audio processing, state management, and result formatting.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Initialize the audio processor with configuration, models, and state."""
+        # Extract per-session options before passing to TranscriptionEngine
+        session_language = kwargs.pop('language', None)
+        session_context = kwargs.pop('context', None)
+        session_vocabulary = kwargs.pop('vocabulary', None)
+        self.stream_event_queue = kwargs.pop('stream_event_queue', None)
+        self._stream_events_after_snapshot = (
+            asyncio.Queue() if self.stream_event_queue is not None else None
+        )
+        session_pcm_input = kwargs.pop('pcm_input', None)
+        # Output mode of the session: "full" resends the whole transcript on
+        # every update, so history must never be pruned away (issue #372);
+        # "diff" clients keep their own copy and allow bounded server memory.
+        session_mode = kwargs.pop('mode', 'full')
+        session_target_language = kwargs.pop('target_language', None)
+
+        if 'transcription_engine' in kwargs and isinstance(kwargs['transcription_engine'], TranscriptionEngine):
+            models = kwargs['transcription_engine']
+        else:
+            models = TranscriptionEngine(**kwargs)
+
+        # Audio processing settings
+        self.args = models.args
+        configured_pause_segmentation_seconds = getattr(
+            self.args,
+            "pause_segmentation_seconds",
+            MIN_DURATION_REAL_SILENCE,
+        )
+        self.pause_segmentation_seconds = validate_pause_segmentation_seconds(
+            configured_pause_segmentation_seconds
+        )
+        self.sample_rate = 16000
+        self.channels = 1
+        chunk_seconds = self.args.vac_chunk_size if self.args.vac else self.args.min_chunk_size
+        self.samples_per_sec = int(self.sample_rate * chunk_seconds)
+        self.bytes_per_sample = 2
+        self.bytes_per_sec = self.samples_per_sec * self.bytes_per_sample
+        max_samples = max(1, int(getattr(self.args, "max_buffered_audio", 30.0) * self.sample_rate))
+        self.max_bytes_per_sec = min(32000 * 5, max_samples * self.bytes_per_sample)
+        self.is_pcm_input = (
+            self.args.pcm_input
+            if session_pcm_input is None
+            else bool(session_pcm_input)
+        )
+
+        # State management
+        self.is_stopping: bool = False
+        self.current_silence: Optional[Silence] = None
+        self.state: State = State()
+        self.lock: asyncio.Lock = asyncio.Lock()
+        self.sep: str = " "  # Default separator
+        self.last_response_content: FrontData = FrontData()
+
+        self.tokens_alignment: TokensAlignment = TokensAlignment(
+            self.state,
+            self.args,
+            self.sep,
+            retention_seconds=resolve_retention_seconds(
+                getattr(self.args, "retention_seconds", None), session_mode
+            ),
+        )
+        self.beg_loop: Optional[float] = None
+
+        # Models and processing
+        self.asr: Any = models.asr
+        self.vac: Optional[Any] = None
+
+        if self.args.vac:
+            from whisperlivekit.silero_vad_iterator import (
+                FixedVADIterator,
+                OnnxWrapper,
+                load_jit_vad,
+            )
+
+            if models.vac_session is not None:
+                vac_model = OnnxWrapper(session=models.vac_session)
+                self.vac = FixedVADIterator(vac_model)
+            else:
+                self.vac = FixedVADIterator(load_jit_vad())
+        self.audio_input = AudioInput(
+            pcm_input=self.is_pcm_input, sample_rate=self.sample_rate, channels=self.channels,
+            chunk_bytes=self.bytes_per_sec, max_chunk_bytes=self.max_bytes_per_sec,
+            on_pcm=self._process_pcm_array, on_eof=self._finish_input,
+        )
+        self.ffmpeg_manager = self.audio_input.decoder
+        self.ffmpeg_reader_task: Optional[asyncio.Task] = None
+
+        self.overload_error: Optional[str] = None
+        self.processing_error: Optional[str] = None
+        queue_options = {
+            "timeout": getattr(self.args, "backpressure_timeout", 30.0),
+            "on_overload": self._on_overload,
+        }
+        self.transcription_queue = (
+            ProcessingQueue("Transcription", max_samples=max_samples, **queue_options)
+            if self.args.transcription else None
+        )
+        self.diarization_queue = (
+            ProcessingQueue("Diarization", max_samples=max_samples, **queue_options)
+            if self.args.diarization else None
+        )
+        self.translation_queue = (
+            ProcessingQueue("Translation", **queue_options) if self.args.target_language else None
+        )
+        self.pcm_buffer = self.audio_input.buffer
+        self.total_pcm_samples: int = 0
+        self.transcription_task: Optional[asyncio.Task] = None
+        self.diarization_task: Optional[asyncio.Task] = None
+        self.translation_task: Optional[asyncio.Task] = None
+        self.watchdog_task: Optional[asyncio.Task] = None
+        self.all_tasks_for_cleanup: List[asyncio.Task] = []
+        self.metrics: SessionMetrics = SessionMetrics()
+
+        self.transcription: Optional[Any] = None
+        self.translation: Optional[Any] = None
+        self.diarization: Optional[Any] = None
+
+        if self.args.transcription:
+            self.transcription = online_factory(
+                self.args,
+                models.asr,
+                language=session_language,
+                context=session_context,
+                vocabulary=session_vocabulary,
+            )
+            self.sep = self.transcription.asr.sep
+        self.server_endpointing = bool(
+            getattr(self.transcription, "server_endpointing", False)
+        )
+        self._server_endpoint_vad_silent = True
+        if self.args.diarization:
+            self.diarization = online_diarization_factory(self.args, models.diarization_model)
+        if models.translation_model:
+            if session_language or session_target_language:
+                from whisperlivekit.translation import session_translation_factory
+                self.translation = session_translation_factory(
+                    self.args, models.translation_model,
+                    session_target_language or self.args.target_language,
+                    source_language=session_language,
+                )
+            else:
+                self.translation = online_translation_factory(self.args, models.translation_model)
+        elif session_target_language:
+            logger.warning(
+                "Session requested target_language=%r but the server was started "
+                "without translation (--target-language); ignoring.",
+                session_target_language,
+            )
+
+        # Translate-on-segment-complete (issue #264): when enabled, committed
+        # tokens are held back until their segment is finalized by punctuation
+        # (or a silence/end-of-stream boundary), so the translation output does
+        # not flicker while the partial text evolves.
+        self.translate_on_complete: bool = bool(getattr(self.args, "translate_on_complete", False))
+        self._pending_translation_tokens: List[ASRToken] = []
+
+        # Silent-backend watchdog: flips once the ASR has produced anything.
+        self._any_asr_output: bool = False
+        self._silent_backend_warned: bool = False
+
+    def _on_overload(self, message):
+        self.overload_error = message
+        self.is_stopping = True
+        logger.warning("Closing overloaded audio session: %s", message)
+        self._close_queues()
+
+    def _close_queues(self):
+        for queue in (self.transcription_queue, self.diarization_queue, self.translation_queue):
+            if isinstance(queue, ProcessingQueue):
+                queue.close()
+
+    def _fail_processing(self, exc, stage="ASR"):
+        if self.processing_error:
+            return
+        self.processing_error = f"{stage} failed: {type(exc).__name__}: {exc}"
+        self.is_stopping = True
+        logger.exception("Closing failed %s session", stage)
+        self._close_queues()
+
+    async def _emit_stream_event(self, kind: str, timestamp: float) -> None:
+        """Publish a protocol-neutral event on the submitted audio clock."""
+        event_queue = getattr(self, "stream_event_queue", None)
+        if event_queue is not None:
+            await event_queue.put(
+                AudioStreamEvent(kind=kind, timestamp=float(timestamp))
+            )
+
+    async def _emit_stream_event_after_snapshot(
+        self,
+        kind: str,
+        timestamp: float,
+    ) -> None:
+        """Publish only after results_formatter yields the matching state."""
+        pending_queue = getattr(self, "_stream_events_after_snapshot", None)
+        if pending_queue is None:
+            return
+        acknowledged = asyncio.get_running_loop().create_future()
+        await pending_queue.put(
+            (
+                AudioStreamEvent(kind=kind, timestamp=float(timestamp)),
+                acknowledged,
+            )
+        )
+        await acknowledged
+
+    async def _queue_tokens_for_translation(self, tokens: List[ASRToken]) -> None:
+        """Forward committed tokens to the translation queue.
+
+        With translate_on_complete, tokens are held back until a token
+        carrying punctuation closes the segment; the incomplete tail stays
+        pending and is not translated (issue #264).
+        """
+        if not self.translation_queue or not tokens:
+            return
+        if not self.translate_on_complete:
+            for token in tokens:
+                await self.translation_queue.put(token)
+            return
+        self._pending_translation_tokens.extend(tokens)
+        last_punctuation_idx = -1
+        for i, token in enumerate(self._pending_translation_tokens):
+            if token.has_punctuation():
+                last_punctuation_idx = i
+        if last_punctuation_idx >= 0:
+            for token in self._pending_translation_tokens[:last_punctuation_idx + 1]:
+                await self.translation_queue.put(token)
+            self._pending_translation_tokens = self._pending_translation_tokens[last_punctuation_idx + 1:]
+
+    _SILENT_BACKEND_WARN_SECONDS = 20.0
+
+    def _warn_if_backend_silent(self, audio_seconds: float) -> None:
+        """One-time loud error when the ASR consumed audio but never produced
+        a single token or buffer character.
+
+        Every real occurrence of this so far was a backend failing on every
+        chunk while its exceptions were only logged as warnings (torch 2.13
+        MLX device mismatch #383, CTranslate2 wheels with PTX newer than the
+        driver): the server looked healthy and sessions showed empty captions.
+        """
+        if self._silent_backend_warned or self._any_asr_output:
+            return
+        if audio_seconds < self._SILENT_BACKEND_WARN_SECONDS:
+            return
+        self._silent_backend_warned = True
+        logger.error(
+            "ASR backend produced no output after %.0f s of audio. The backend "
+            "is likely failing on every chunk; check earlier warnings for the "
+            "root cause (device mismatches, incompatible wheels, model load "
+            "errors).",
+            audio_seconds,
+        )
+
+    async def _flush_pending_translation_tokens(self) -> None:
+        """Release held-back tokens at a segment boundary (silence or end of stream)."""
+        if self.translation_queue and self._pending_translation_tokens:
+            for token in self._pending_translation_tokens:
+                await self.translation_queue.put(token)
+            self._pending_translation_tokens = []
+
+    async def _queue_hypothesis_tail_for_translation(self, buffer_transcript) -> None:
+        """Forward the unstable ASR tail to translation backends that opt in.
+
+        A streaming translator (AlignAtt) drafts ahead over the tail while
+        committing only against committed words; NLLB never sees it.
+        """
+        if not self.translation_queue or self.translation is None:
+            return
+        if not getattr(self.translation, "wants_hypothesis_tail", False):
+            return
+        text = (buffer_transcript.text or "").strip() if buffer_transcript else ""
+        if not text:
+            return
+        await self.translation_queue.put(HypothesisTail(
+            start=buffer_transcript.start,
+            end=buffer_transcript.end,
+            text=text,
+        ))
+
+    async def _push_silence_event(self) -> None:
+        if self.transcription_queue:
+            await self.transcription_queue.put(self.current_silence)
+        if self.args.diarization and self.diarization_queue:
+            await self.diarization_queue.put(self.current_silence)
+        if self.translation_queue and not self.transcription_queue:
+            await self._flush_pending_translation_tokens()
+            await self.translation_queue.put(self.current_silence)
+
+    async def _begin_silence(self, at_sample: Optional[int] = None) -> None:
+        if self.current_silence:
+            return
+        # Use audio stream time (sample-precise) for accurate silence duration
+        if at_sample is not None:
+            audio_t = at_sample / self.sample_rate
+        else:
+            audio_t = self.total_pcm_samples / self.sample_rate if self.sample_rate else 0.0
+        self.current_silence = Silence(
+            is_starting=True, start=audio_t
+        )
+        await self._emit_stream_event("silence_started", audio_t)
+        # Push a separate start-only event so _end_silence won't mutate it
+        start_event = Silence(is_starting=True, start=audio_t)
+        if self.transcription_queue:
+            await self.transcription_queue.put(start_event)
+        if self.args.diarization and self.diarization_queue:
+            await self.diarization_queue.put(start_event)
+        if self.translation_queue and not self.transcription_queue:
+            await self._flush_pending_translation_tokens()
+            await self.translation_queue.put(start_event)
+        if not self.transcription_queue:
+            await self._emit_stream_event("silence_transcription_ready", audio_t)
+
+    def _is_pause_segmentation_boundary(self, silence: Silence) -> bool:
+        """Whether a completed pause crosses the output threshold."""
+        threshold = getattr(
+            self,
+            "pause_segmentation_seconds",
+            MIN_DURATION_REAL_SILENCE,
+        )
+        if threshold <= 0 or silence.start is None:
+            return False
+        duration = silence.duration
+        return duration is not None and duration > threshold
+
+    async def _end_silence(
+        self,
+        at_sample: Optional[int] = None,
+        *,
+        speech_resumed: bool = False,
+    ) -> None:
+        if not self.current_silence:
+            return
+        if at_sample is not None:
+            audio_t = at_sample / self.sample_rate
+        else:
+            audio_t = self.total_pcm_samples / self.sample_rate if self.sample_rate else 0.0
+        self.current_silence.end = audio_t
+        self.current_silence.is_starting = False
+        self.current_silence.has_ended = True
+        self.current_silence.compute_duration()
+        self.metrics.n_silence_events += 1
+        if self.current_silence.duration is not None:
+            self.metrics.total_silence_duration_s += self.current_silence.duration
+        if (
+            not self.transcription_queue
+            and self._is_pause_segmentation_boundary(self.current_silence)
+        ):
+            # With transcription enabled, the transcription queue publishes
+            # this marker after any words committed by the silence-start event.
+            self.state.new_tokens.append(self.current_silence)
+        # Push the completed silence as the end event (separate from the start event)
+        await self._push_silence_event()
+        self.current_silence = None
+        if speech_resumed:
+            await self._emit_stream_event("speech_started", audio_t)
+
+    async def _enqueue_active_audio(self, pcm_chunk: np.ndarray) -> None:
+        if pcm_chunk is None or pcm_chunk.size == 0:
+            return
+        if self.transcription_queue:
+            await self.transcription_queue.put(pcm_chunk.copy())
+        if self.args.diarization and self.diarization_queue:
+            await self.diarization_queue.put(pcm_chunk.copy())
+
+    def convert_pcm_to_float(self, pcm_buffer: Union[bytes, bytearray]) -> np.ndarray:
+        """Convert PCM buffer in s16le format to normalized NumPy array."""
+        return np.frombuffer(pcm_buffer, dtype=np.int16).astype(np.float32) / 32768.0
+
+    def _latest_committed_transcription_end(self) -> float:
+        latest_end = self.state.end_transcription_committed
+        if self.state.tokens:
+            latest_end = max(latest_end, self.state.tokens[-1].end or 0.0)
+        return latest_end
+
+    async def get_current_state(self) -> State:
+        """Get current state."""
+        async with self.lock:
+            current_time = time()
+
+            remaining_transcription = 0
+            if self.state.end_buffer > 0:
+                remaining_transcription = max(0, round(current_time - self.beg_loop - self.state.end_buffer, 1))
+
+            remaining_diarization = 0
+            if self.state.tokens:
+                latest_end = max(self.state.end_buffer, self.state.tokens[-1].end if self.state.tokens else 0)
+                remaining_diarization = max(0, round(latest_end - self.state.end_attributed_speaker, 1))
+
+            self.state.remaining_time_transcription = remaining_transcription
+            self.state.remaining_time_diarization = remaining_diarization
+
+            if getattr(getattr(self, "args", None), "transcription", True):
+                audio_received_end = self.total_pcm_samples / self.sample_rate if self.sample_rate else 0.0
+                processed_end = max(0.0, self.state.end_transcription_processed)
+                committed_end = self._latest_committed_transcription_end()
+                self.state.end_transcription_committed = committed_end
+                self.state.remaining_time_transcription_processing = max(
+                    0.0,
+                    round(audio_received_end - processed_end, 1),
+                )
+                self.state.remaining_time_transcription_policy = max(
+                    0.0,
+                    round(processed_end - committed_end, 1),
+                )
+            else:
+                self.state.remaining_time_transcription_processing = 0.0
+                self.state.remaining_time_transcription_policy = 0.0
+
+            return self.state
+
+    def _prune_state_tokens(self) -> None:
+        """Bound persistent token history while keeping recent timing context."""
+        if not self.state.tokens:
+            return
+
+        retention_seconds = getattr(self.tokens_alignment, "_retention_seconds", 300.0)
+        latest_end = max(self.state.end_buffer, self.state.tokens[-1].end)
+        cutoff = latest_end - retention_seconds
+        if cutoff <= 0:
+            return
+
+        for idx, token in enumerate(self.state.tokens):
+            if token.end >= cutoff:
+                if idx:
+                    self.state.tokens = self.state.tokens[idx:]
+                return
+
+        self.state.tokens = self.state.tokens[-1:]
+
+    async def ffmpeg_stdout_reader(self) -> None:
+        await self.audio_input.read()
+
+    async def _finish_input(self) -> None:
+        await self._finalize_current_silence_at_stream_end()
+        await self._signal_input_complete()
+
+    async def _signal_input_complete(self) -> None:
+        """Signal end-of-input to the first active processing queue."""
+        if self.transcription_queue:
+            await self.transcription_queue.put(SENTINEL)
+            return
+        if self.diarization_queue:
+            await self.diarization_queue.put(SENTINEL)
+        if self.translation_queue:
+            await self.translation_queue.put(SENTINEL)
+
+    async def _run_counted_transcription_call(self, method, *args):
+        """Run one ASR call and record its duration, call count, and tokens."""
+        _t0 = perf_counter()
+        tokens, processed_upto = await asyncio.to_thread(method, *args)
+        duration = perf_counter() - _t0
+        self.metrics.transcription_durations.append(duration)
+        self.metrics.total_processing_time_s += duration
+        self.metrics.n_transcription_calls += 1
+        tokens = tokens or []
+        self.metrics.n_tokens_produced += len(tokens)
+        return tokens, processed_upto
+
+    async def _run_counted_process_iter(self):
+        """Run process_iter(), recording it in metrics like the normal path."""
+        return await self._run_counted_transcription_call(
+            self.transcription.process_iter
+        )
+
+    async def _finish_transcription(self, pending_tokens=None) -> None:
+        """Call finish() on the online processor to flush remaining tokens.
+
+        pending_tokens carries anything already committed by a coalescing drain,
+        which has already been counted by that drain. The terminal backend call
+        is measured independently and only its own returned tokens increment the
+        token metric.
+        """
+        if not self.transcription:
+            return
+        try:
+            if hasattr(self.transcription, 'finish'):
+                finished_tokens, end_time = (
+                    await self._run_counted_transcription_call(
+                        self.transcription.finish
+                    )
+                )
+            else:
+                # SimulStreamingOnlineProcessor uses start_silence() → process_iter(is_last=True)
+                finished_tokens, end_time = (
+                    await self._run_counted_transcription_call(
+                        self.transcription.start_silence
+                    )
+                )
+
+            # pending_tokens were already counted by the explicit coalescing drain.
+            # The helper above counted only tokens newly returned by finish().
+            final_tokens = (pending_tokens or []) + finished_tokens
+            synthetic_token_count = 0
+            _buffer_transcript = self.transcription.get_buffer()
+            if not final_tokens and self.state.buffer_transcription and self.state.buffer_transcription.text:
+                pending = self.state.buffer_transcription
+                text = pending.text.strip()
+                if text:
+                    start = pending.start if pending.start is not None else self.state.end_buffer
+                    end = pending.end if pending.end is not None else end_time
+                    if end is None or end < start:
+                        end = start
+                    word_matches = list(re.finditer(r"\S+", text))
+                    word_duration = (end - start) / len(word_matches)
+                    final_tokens = []
+                    for index, word_match in enumerate(word_matches):
+                        text_start = 0 if index == 0 else word_matches[index - 1].end()
+                        final_tokens.append(
+                            ASRToken(
+                                start=start + index * word_duration,
+                                end=(
+                                    end
+                                    if index == len(word_matches) - 1
+                                    else start + (index + 1) * word_duration
+                                ),
+                                text=text[text_start:word_match.end()],
+                                detected_language=pending.detected_language,
+                            )
+                        )
+                    synthetic_token_count = len(final_tokens)
+                    _buffer_transcript = Transcript()
+
+            final_committed_end = final_tokens[-1].end if final_tokens else None
+            async with self.lock:
+                self.state.end_transcription_processed = max(
+                    self.state.end_transcription_processed,
+                    end_time,
+                )
+                if final_committed_end is not None:
+                    self.state.end_transcription_committed = max(
+                        self.state.end_transcription_committed,
+                        final_committed_end,
+                    )
+            if final_tokens:
+                logger.info(f"Finish flushed {len(final_tokens)} tokens")
+                # Synthetic buffer recovery did not come from a counted backend
+                # call, but it still creates output tokens exposed to consumers.
+                self.metrics.n_tokens_produced += synthetic_token_count
+                async with self.lock:
+                    self.state.tokens.extend(final_tokens)
+                    self.state.buffer_transcription = _buffer_transcript
+                    self.state.end_buffer = max(self.state.end_buffer, end_time)
+                    self.state.new_tokens.extend(final_tokens)
+                    self.state.new_tokens_buffer = _buffer_transcript
+                    self._prune_state_tokens()
+                await self._queue_tokens_for_translation(final_tokens)
+            # End of stream finalizes the last segment even without punctuation
+            await self._flush_pending_translation_tokens()
+        except Exception as e:
+            self._fail_processing(e)
+
+    async def transcription_processor(self) -> None:
+        """Process audio chunks for transcription."""
+        cumulative_pcm_duration_stream_time = 0.0
+
+        coalesce_min_s = resolve_coalesce_min_s(getattr(self.args, "asr_coalesce_min_s", 0.0))
+        if getattr(self.transcription, "realtime_audio_streaming", False):
+            # Native streaming backends send fixed PCM frames continuously;
+            # HTTP snapshot coalescing must never delay them.
+            coalesce_min_s = 0.0
+        deferred_audio_s = 0.0
+
+        while True:
+            try:
+                # Use a timeout so we periodically wake up and refresh the
+                # buffer state.  Streaming backends (e.g. voxtral) may
+                # produce text tokens asynchronously; without a periodic
+                # drain, those tokens would sit unread until the next audio
+                # chunk arrives — causing the frontend to show nothing.
+                try:
+                    item = await asyncio.wait_for(
+                        get_all_from_queue(self.transcription_queue),
+                        timeout=0.5,
+                    )
+                except asyncio.TimeoutError:
+                    # No new audio — just refresh buffer for streaming backends
+                    _buffer_transcript = self.transcription.get_buffer()
+                    async with self.lock:
+                        self.state.buffer_transcription = _buffer_transcript
+                    continue
+
+                if item is SENTINEL:
+                    logger.debug("Transcription processor received sentinel. Finishing.")
+                    drained_tokens = []
+                    if deferred_audio_s > 0.0:
+                        # finish() runs no inference on LocalAgreement, so deferred
+                        # audio would never be transcribed at all.
+                        drained_tokens, _ = await self._run_counted_process_iter()
+                        deferred_audio_s = 0.0
+                    await self._finish_transcription(pending_tokens=drained_tokens)
+                    break
+
+                asr_internal_buffer_duration_s = len(getattr(self.transcription, 'audio_buffer', [])) / self.transcription.SAMPLING_RATE
+                transcription_lag_s = max(0.0, time() - self.beg_loop - self.state.end_buffer)
+                asr_processing_logs = f"internal_buffer={asr_internal_buffer_duration_s:.2f}s | lag={transcription_lag_s:.2f}s |"
+                stream_time_end_of_current_pcm = cumulative_pcm_duration_stream_time
+                new_tokens = []
+                segmentation_silence = None
+                current_audio_processed_upto = self.state.end_buffer
+
+                # Boundary handlers reset the processor, and on LocalAgreement a
+                # token needs two agreeing passes to commit. Give deferred audio
+                # its first pass here so the handler's own pass is its second,
+                # exactly as when every chunk is inferred on arrival.
+                if deferred_audio_s > 0.0 and not isinstance(item, np.ndarray):
+                    new_tokens, current_audio_processed_upto = await self._run_counted_process_iter()
+                    deferred_audio_s = 0.0
+
+                if isinstance(item, Silence):
+                    if item.is_starting:
+                        started, silence_processed_upto = (
+                            await self._run_counted_transcription_call(
+                                self.transcription.start_silence
+                            )
+                        )
+                        new_tokens = new_tokens + (started or [])
+                        current_audio_processed_upto = max(
+                            current_audio_processed_upto,
+                            silence_processed_upto,
+                        )
+                        asr_processing_logs += " + Silence starting"
+                    if item.has_ended:
+                        asr_processing_logs += f" + Silence of = {item.duration:.2f}s"
+                        cumulative_pcm_duration_stream_time += item.duration
+                        current_audio_processed_upto = cumulative_pcm_duration_stream_time
+                        self.transcription.end_silence(item.duration, self.state.tokens[-1].end if self.state.tokens else 0)
+                        if self._is_pause_segmentation_boundary(item):
+                            segmentation_silence = item
+                    if self.state.tokens:
+                        asr_processing_logs += f" | last_end = {self.state.tokens[-1].end} |"
+                    logger.info(asr_processing_logs)
+                    new_tokens = new_tokens or []
+                    current_audio_processed_upto = max(current_audio_processed_upto, stream_time_end_of_current_pcm)
+                elif isinstance(item, ChangeSpeaker):
+                    speaker_tokens, speaker_processed_upto = (
+                        await self._run_counted_transcription_call(
+                            self.transcription.new_speaker,
+                            item,
+                        )
+                    )
+                    new_tokens = new_tokens + speaker_tokens
+                    current_audio_processed_upto = max(
+                        current_audio_processed_upto,
+                        speaker_processed_upto,
+                    )
+                    asr_processing_logs += f" + Speaker {item.speaker}"
+                elif isinstance(item, np.ndarray):
+                    pcm_array = item
+                    logger.info(asr_processing_logs)
+                    cumulative_pcm_duration_stream_time += len(pcm_array) / self.sample_rate
+                    stream_time_end_of_current_pcm = cumulative_pcm_duration_stream_time
+                    self.transcription.insert_audio_chunk(pcm_array, stream_time_end_of_current_pcm)
+
+                    chunk_s = len(pcm_array) / self.sample_rate
+                    if should_defer_inference(deferred_audio_s, chunk_s, coalesce_min_s):
+                        # Nothing to publish: the hypothesis buffer only changes
+                        # when process_iter() runs, and re-publishing it raw would
+                        # undo the committed-prefix strip applied below.
+                        deferred_audio_s += chunk_s
+                        continue
+                    deferred_audio_s = 0.0
+
+                    new_tokens, current_audio_processed_upto = (
+                        await self._run_counted_process_iter()
+                    )
+
+                _buffer_transcript = self.transcription.get_buffer()
+                buffer_text = _buffer_transcript.text
+
+                if new_tokens:
+                    validated_text = self.sep.join([t.text for t in new_tokens])
+                    if buffer_text.startswith(validated_text):
+                        _buffer_transcript.text = buffer_text[len(validated_text):].lstrip()
+
+                candidate_end_times = [self.state.end_buffer]
+
+                if new_tokens:
+                    candidate_end_times.append(new_tokens[-1].end)
+
+                if _buffer_transcript.end is not None:
+                    candidate_end_times.append(_buffer_transcript.end)
+
+                candidate_end_times.append(current_audio_processed_upto)
+
+                async with self.lock:
+                    self.state.tokens.extend(new_tokens)
+                    self.state.buffer_transcription = _buffer_transcript
+                    self.state.end_buffer = max(candidate_end_times)
+                    self.state.end_transcription_processed = max(
+                        self.state.end_transcription_processed,
+                        current_audio_processed_upto,
+                    )
+                    if new_tokens:
+                        self.state.end_transcription_committed = max(
+                            self.state.end_transcription_committed,
+                            new_tokens[-1].end or 0.0,
+                        )
+                    self.state.new_tokens.extend(new_tokens)
+                    if segmentation_silence is not None:
+                        self.state.new_tokens.append(segmentation_silence)
+                    self.state.new_tokens_buffer = _buffer_transcript
+                    self._prune_state_tokens()
+
+                if new_tokens or buffer_text.strip():
+                    self._any_asr_output = True
+                else:
+                    self._warn_if_backend_silent(cumulative_pcm_duration_stream_time)
+
+                await self._queue_tokens_for_translation(new_tokens)
+                await self._queue_hypothesis_tail_for_translation(_buffer_transcript)
+                if isinstance(item, Silence) and item.is_starting:
+                    await self._emit_stream_event_after_snapshot(
+                        "silence_transcription_ready",
+                        item.start or 0.0,
+                    )
+                if isinstance(item, Silence) and self.translation_queue:
+                    # The silence-start ASR call can commit the final words of
+                    # the utterance. Forward those words before resetting the
+                    # translation boundary, then preserve the completed event.
+                    if item.is_starting:
+                        await self._flush_pending_translation_tokens()
+                    await self.translation_queue.put(item)
+            except (PipelineClosed, PipelineOverloaded):
+                return
+            except Exception as e:
+                self._fail_processing(e)
+                return
+
+        if self.is_stopping:
+            logger.info("Transcription processor finishing due to stopping flag.")
+            if self.diarization_queue and not getattr(self.diarization_queue, "closed", False):
+                await self.diarization_queue.put(SENTINEL)
+            if self.translation_queue and not getattr(self.translation_queue, "closed", False):
+                await self.translation_queue.put(SENTINEL)
+
+        logger.info("Transcription processor task finished.")
+
+
+    async def _update_diarization_state(self, diarization_segments) -> None:
+        """Push new diarization segments into the shared state."""
+        if not diarization_segments:
+            return
+        diar_end = max(getattr(s, "end", 0.0) for s in diarization_segments)
+        async with self.lock:
+            self.state.new_diarization.extend(diarization_segments)
+            self.state.end_attributed_speaker = max(self.state.end_attributed_speaker, diar_end)
+
+    async def _drain_diarization_buffer(self) -> None:
+        """Process all remaining audio in the diarization buffer.
+
+        Sortformer-style backends accumulate audio in an internal buffer and
+        process one chunk per ``diarize()`` call, returning ``[]`` when the
+        buffer is too short.  This helper loops until the buffer is fully
+        consumed.
+        """
+        while True:
+            diarization_segments = await self.diarization.diarize()
+            if not diarization_segments:
+                break
+            await self._update_diarization_state(diarization_segments)
+
+    async def diarization_processor(self) -> None:
+        has_buffer = hasattr(self.diarization, 'buffer_audio')
+        while True:
+            try:
+                item = await get_all_from_queue(self.diarization_queue)
+                if item is SENTINEL:
+                    break
+                elif isinstance(item, Silence):
+                    if item.has_ended:
+                        self.diarization.insert_silence(item.duration)
+                    continue
+                self.diarization.insert_audio_chunk(item)
+                if has_buffer:
+                    await self._drain_diarization_buffer()
+                else:
+                    # Cumulative backends (e.g. Diart): replace, not extend
+                    diarization_segments = await self.diarization.diarize()
+                    diar_end = 0.0
+                    if diarization_segments:
+                        diar_end = max(getattr(s, "end", 0.0) for s in diarization_segments)
+                    async with self.lock:
+                        self.state.new_diarization = diarization_segments
+                        self.state.end_attributed_speaker = max(self.state.end_attributed_speaker, diar_end)
+            except (PipelineClosed, PipelineOverloaded):
+                return
+            except Exception as e:
+                self._fail_processing(e, stage="Diarization")
+                return
+        # Drain any remaining audio in the buffer before exiting
+        if has_buffer:
+            try:
+                await self._drain_diarization_buffer()
+            except Exception as e:
+                self._fail_processing(e, stage="Diarization")
+        logger.info("Diarization processor task finished.")
+
+    async def translation_processor(self) -> None:
+        await run_translation(self.translation_queue, self.translation, self.state, self.lock)
+
+    async def results_formatter(self) -> AsyncGenerator[FrontData, None]:
+        """Format processing results for output."""
+        while True:
+            try:
+                if getattr(self, "overload_error", None):
+                    yield FrontData(status="error", error=self.overload_error)
+                    return
+                if getattr(self, "processing_error", None):
+                    yield FrontData(status="error", error=self.processing_error)
+                    return
+                if self.audio_input.error:
+                    yield FrontData(status="error", error=f"FFmpeg error: {self.audio_input.error}")
+                    return
+
+                # Completion can happen while a consumer sends the yielded
+                # response. Only end after a snapshot taken with all producers
+                # already done; otherwise their final updates need another pass.
+                upstream_done = self.is_stopping and self._processing_tasks_done()
+                self.tokens_alignment.update()
+                audio_time = (
+                    self.total_pcm_samples / self.sample_rate
+                    if self.sample_rate
+                    else 0.0
+                )
+                lines, buffer_diarization_text, buffer_translation_text = self.tokens_alignment.get_lines(
+                    diarization=self.args.diarization,
+                    translation=bool(self.translation),
+                    audio_time=audio_time,
+                )
+                state = await self.get_current_state()
+
+                buffer_transcription_text = state.buffer_transcription.text if state.buffer_transcription else ''
+
+                response_status = "active_transcription"
+                if not lines and not buffer_transcription_text and not buffer_diarization_text:
+                    response_status = "no_audio_detected"
+
+                response = FrontData(
+                    status=response_status,
+                    lines=lines,
+                    buffer_transcription=buffer_transcription_text,
+                    buffer_diarization=buffer_diarization_text,
+                    buffer_translation=buffer_translation_text,
+                    remaining_time_transcription=state.remaining_time_transcription,
+                    remaining_time_transcription_processing=state.remaining_time_transcription_processing,
+                    remaining_time_transcription_policy=state.remaining_time_transcription_policy,
+                    remaining_time_diarization=state.remaining_time_diarization if self.args.diarization else 0,
+                    translation_error=getattr(self.translation, "error", "")
+                )
+
+                deferred_events = []
+                pending_queue = getattr(self, "_stream_events_after_snapshot", None)
+                if pending_queue is not None:
+                    while not pending_queue.empty():
+                        deferred_events.append(pending_queue.get_nowait())
+
+                should_push = (
+                    response != self.last_response_content
+                    or bool(deferred_events)
+                )
+                if should_push:
+                    self.metrics.n_responses_sent += 1
+                    yield response
+                    self.last_response_content = response
+                for event, acknowledged in deferred_events:
+                    await self.stream_event_queue.put(event)
+                    if not acknowledged.done():
+                        acknowledged.set_result(None)
+                    pending_queue.task_done()
+
+                if upstream_done:
+                    if getattr(self, "processing_error", None):
+                        continue
+                    logger.info("Results formatter: All upstream processors are done and in stopping state. Terminating.")
+                    return
+
+                await asyncio.sleep(0.05)
+
+            except Exception:
+                logger.warning(f"Exception in results_formatter. Traceback: {traceback.format_exc()}")
+                yield FrontData(status="error", error="Unable to format transcription results.")
+                return
+
+    async def create_tasks(self) -> AsyncGenerator[FrontData, None]:
+        """Create and start processing tasks."""
+        self.all_tasks_for_cleanup = []
+        processing_tasks_for_watchdog: List[asyncio.Task] = []
+
+        # If using FFmpeg (non-PCM input), start it and spawn stdout reader
+        if not self.is_pcm_input:
+            success = await self.ffmpeg_manager.start()
+            if not success:
+                logger.error("Failed to start FFmpeg manager")
+                async def error_generator() -> AsyncGenerator[FrontData, None]:
+                    yield FrontData(
+                        status="error",
+                        error="FFmpeg failed to start. Please check that FFmpeg is installed."
+                    )
+                return error_generator()
+            self.ffmpeg_reader_task = asyncio.create_task(self.ffmpeg_stdout_reader())
+            self.all_tasks_for_cleanup.append(self.ffmpeg_reader_task)
+            processing_tasks_for_watchdog.append(self.ffmpeg_reader_task)
+
+        if self.transcription:
+            self.transcription_task = asyncio.create_task(self.transcription_processor())
+            self.all_tasks_for_cleanup.append(self.transcription_task)
+            processing_tasks_for_watchdog.append(self.transcription_task)
+
+        if self.diarization:
+            self.diarization_task = asyncio.create_task(self.diarization_processor())
+            self.all_tasks_for_cleanup.append(self.diarization_task)
+            processing_tasks_for_watchdog.append(self.diarization_task)
+
+        if self.translation:
+            self.translation_task = asyncio.create_task(self.translation_processor())
+            self.all_tasks_for_cleanup.append(self.translation_task)
+            processing_tasks_for_watchdog.append(self.translation_task)
+
+        # Monitor overall system health
+        self.watchdog_task = asyncio.create_task(self.watchdog(processing_tasks_for_watchdog))
+        self.all_tasks_for_cleanup.append(self.watchdog_task)
+
+        return self.results_formatter()
+
+    async def watchdog(self, tasks_to_monitor: List[asyncio.Task]) -> None:
+        """Monitors the health of critical processing tasks."""
+        tasks_remaining: List[asyncio.Task] = [task for task in tasks_to_monitor if task]
+        while True:
+            try:
+                if not tasks_remaining:
+                    logger.info("Watchdog task finishing: all monitored tasks completed.")
+                    return
+
+                await asyncio.sleep(10)
+
+                for i, task in enumerate(list(tasks_remaining)):
+                    if task.done():
+                        exc = task.exception()
+                        task_name = task.get_name() if hasattr(task, 'get_name') else f"Monitored Task {i}"
+                        if exc:
+                            logger.error(f"{task_name} unexpectedly completed with exception: {exc}")
+                        else:
+                            logger.info(f"{task_name} completed normally.")
+                        tasks_remaining.remove(task)
+
+            except asyncio.CancelledError:
+                logger.info("Watchdog task cancelled.")
+                break
+            except Exception as e:
+                logger.error(f"Error in watchdog task: {e}", exc_info=True)
+
+    async def cleanup(self) -> None:
+        """Clean up resources when processing is complete."""
+        logger.info("Starting cleanup of AudioProcessor resources.")
+        self.is_stopping = True
+        self._close_queues()
+        try:
+            await close_translation(self.translation)
+        except Exception:
+            logger.exception("Failed to close translation connection")
+        close_transcription = getattr(self.transcription, "close", None)
+        if close_transcription is not None:
+            try:
+                await asyncio.to_thread(close_transcription)
+            except Exception:
+                logger.exception("Failed to close transcription connection")
+        for task in self.all_tasks_for_cleanup:
+            if task and not task.done():
+                task.cancel()
+
+        created_tasks = [t for t in self.all_tasks_for_cleanup if t]
+        if created_tasks:
+            await asyncio.gather(*created_tasks, return_exceptions=True)
+        logger.info("All processing tasks cancelled or finished.")
+
+        if not self.is_pcm_input and self.ffmpeg_manager:
+            try:
+                await self.ffmpeg_manager.stop()
+                logger.info("FFmpeg manager stopped.")
+            except Exception as e:
+                logger.warning(f"Error stopping FFmpeg manager: {e}")
+        if self.diarization:
+            self.diarization.close()
+
+        # Finalize session metrics
+        queues = [q for q in (self.transcription_queue, self.diarization_queue, self.translation_queue)
+                  if isinstance(q, ProcessingQueue)]
+        self.metrics.backpressure_wait_s = sum(q.wait_seconds for q in queues)
+        self.metrics.peak_queued_audio_s = max((q.peak_samples for q in queues), default=0) / self.sample_rate
+        self.metrics.total_audio_duration_s = self.total_pcm_samples / self.sample_rate
+        self.metrics.log_summary()
+        logger.info("AudioProcessor cleanup complete.")
+
+    def _processing_tasks_done(self) -> bool:
+        """Return True when all active processing tasks have completed."""
+        tasks_to_check = [
+            self.transcription_task,
+            self.diarization_task,
+            self.translation_task,
+            self.ffmpeg_reader_task,
+        ]
+        return all(task.done() for task in tasks_to_check if task)
+
+
+    async def process_audio(self, message: Optional[bytes]) -> None:
+        """Process incoming audio data."""
+
+        if getattr(self, "processing_error", None):
+            raise RuntimeError(self.processing_error)
+
+        if not self.beg_loop:
+            self.beg_loop = time()
+            self.metrics.session_start = self.beg_loop
+            self.current_silence = Silence(start=0.0, is_starting=True)
+            self.tokens_alignment.beg_loop = self.beg_loop
+
+        if not message:
+            logger.info("Empty audio message received, initiating stop sequence.")
+            self.is_stopping = True
+
+            await self.audio_input.finish()
+
+            return
+
+        if self.is_stopping:
+            logger.warning("AudioProcessor is stopping. Ignoring incoming audio.")
+            return
+
+        self.metrics.n_chunks_received += 1
+
+        try:
+            await self.audio_input.write(message)
+        except PipelineClosed:
+            if getattr(self, "processing_error", None):
+                raise RuntimeError(self.processing_error) from None
+            raise
+
+    async def handle_pcm_data(self) -> None:
+        await self.audio_input.drain()
+
+    async def _process_pcm_array(self, pcm_array: np.ndarray) -> None:
+        """Apply VAC segmentation to one PCM array and advance stream time."""
+        if pcm_array is None or pcm_array.size == 0:
+            return
+
+        if getattr(self, "server_endpointing", False):
+            # Qwen Audio must receive the original continuous PCM, including
+            # silence, because its server-side semantic/VAD endpoint decides
+            # sentence_end.  Local VAC remains observational only: it may emit
+            # UI activity events but never inserts a Silence boundary into the
+            # transcription or translation queues.
+            num_samples = len(pcm_array)
+            chunk_sample_start = self.total_pcm_samples
+            chunk_sample_end = chunk_sample_start + num_samples
+            if self.args.vac:
+                for event in self.vac(pcm_array) or []:
+                    if "start" in event and self._server_endpoint_vad_silent:
+                        timestamp = max(
+                            chunk_sample_start,
+                            min(chunk_sample_end, int(event["start"])),
+                        ) / self.sample_rate
+                        self._server_endpoint_vad_silent = False
+                        await self._emit_stream_event("speech_started", timestamp)
+                    if "end" in event and not self._server_endpoint_vad_silent:
+                        timestamp = max(
+                            chunk_sample_start,
+                            min(chunk_sample_end, int(event["end"])),
+                        ) / self.sample_rate
+                        self._server_endpoint_vad_silent = True
+                        await self._emit_stream_event("silence_started", timestamp)
+            self.current_silence = None
+            await self._enqueue_active_audio(pcm_array)
+            self.total_pcm_samples = chunk_sample_end
+            await self._emit_stream_event(
+                "audio_advanced",
+                self.total_pcm_samples / self.sample_rate,
+            )
+            return
+
+        # EOF can send a sub-chunk directly here. Without VAC, clear the
+        # initial placeholder before treating that tail as active speech.
+        if not self.args.vac and self.current_silence:
+            await self._end_silence(
+                at_sample=self.total_pcm_samples,
+                speech_resumed=True,
+            )
+
+        num_samples = len(pcm_array)
+        chunk_sample_start = self.total_pcm_samples
+        chunk_sample_end = chunk_sample_start + num_samples
+
+        vad_events = []
+        if self.args.vac:
+            vad_events = self.vac(pcm_array) or []
+
+        # Iterate over events in chronological order and segment the PCM chunk:
+        #   [last_offset, end_offset]   -> active audio (tail of speech)
+        #   [end_offset, start_offset]  -> silence (skip)
+        #   [start_offset, chunk_end]   -> active audio (start of new speech)
+        # This properly handles cases where both end and start events fall into the same chunk.
+        last_offset = 0
+        for event in vad_events:
+            if "start" in event and self.current_silence:
+                start_sample = int(event["start"])
+                # Clamp the start sample to the current chunk boundaries.
+                # This ensures we don't retrospectively end a silence period
+                # before the current chunk, preventing negative offsets and
+                # ensuring all active audio in the current chunk is captured.
+                start_sample_eff = max(chunk_sample_start, min(chunk_sample_end, start_sample))
+                start_offset = start_sample_eff - chunk_sample_start
+                await self._end_silence(
+                    at_sample=start_sample_eff,
+                    speech_resumed=True,
+                )
+                last_offset = start_offset
+
+            if "end" in event and not self.current_silence:
+                end_sample = int(event["end"])
+                # Clamp the end sample to the current chunk boundaries.
+                # This prevents double-counting the VAD delay overlap, ensuring
+                # the sum of active audio and silence durations strictly equals
+                # the physical stream duration, thereby eliminating timestamp drift.
+                end_sample_eff = max(chunk_sample_start, min(chunk_sample_end, end_sample))
+                end_offset = end_sample_eff - chunk_sample_start
+                if end_offset > last_offset:
+                    await self._enqueue_active_audio(pcm_array[last_offset:end_offset])
+                await self._begin_silence(at_sample=end_sample_eff)
+                last_offset = end_offset
+
+        if not self.current_silence and last_offset < num_samples:
+            await self._enqueue_active_audio(pcm_array[last_offset:])
+
+        self.total_pcm_samples = chunk_sample_end
+        await self._emit_stream_event(
+            "audio_advanced",
+            self.total_pcm_samples / self.sample_rate,
+        )
+
+    async def _finalize_current_silence_at_stream_end(self) -> None:
+        """Commit a trailing pause at the final known stream position."""
+        if getattr(self, "current_silence", None):
+            await self._end_silence(at_sample=getattr(self, "total_pcm_samples", 0))
+
+    async def _flush_remaining_pcm(self) -> None:
+        """Process the final PCM tail and commit any remaining pause."""
+        await self.audio_input.drain(final=True)
+        await self._finalize_current_silence_at_stream_end()

@@ -1,0 +1,51 @@
+:root {
+  --ui-bg: #f3f6f8;
+  --ui-surface: #ffffff;
+  --ui-surface-soft: #f7f9fb;
+  --ui-ink: #182c3d;
+  --ui-text: #34495a;
+  --ui-muted: #5b6d7b;
+  --ui-border: #dce5eb;
+  --ui-border-strong: #b7c8d3;
+  --ui-accent: #087f75;
+  --ui-accent-hover: #06685f;
+  --ui-accent-soft: #e8f5f2;
+  --ui-accent-ink: #08685f;
+  --ui-danger: #a43b3e;
+  --ui-danger-soft: #fff0ef;
+  --ui-warning: #865b14;
+  --ui-warning-soft: #fff6e5;
+  --ui-pdf-bg: #202e3a;
+  --ui-pdf-toolbar: #2d4050;
+  --ui-font: "Avenir Next", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --ui-font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --ui-radius: 12px;
+  --ui-radius-sm: 8px;
+  --ui-shadow: 0 2px 6px rgb(24 44 61 / 3%);
+  --ui-shadow-overlay: 0 24px 80px rgb(24 44 61 / 20%);
+  color: var(--ui-ink);
+  background: var(--ui-bg);
+  font-family: var(--ui-font);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { min-height: 100%; }
+body { margin: 0; }
+button, input, textarea, select { font: inherit; }
+button, a, input, select, textarea, summary { -webkit-tap-highlight-color: transparent; }
+:where(a[href], button:enabled, select:enabled, summary, [role="button"]:not([aria-disabled="true"])) { cursor: pointer; }
+:where(button:disabled, select:disabled, [aria-disabled="true"]) { cursor: default; }
+:where(button, a, input, textarea, select, summary, [tabindex]):focus-visible {
+  outline: 3px solid var(--ui-accent);
+  outline-offset: 3px;
+}
+::selection { color: var(--ui-ink); background: #ccece5; }
+.ui-icon { flex: 0 0 auto; vertical-align: middle; }
+.ui-sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+}

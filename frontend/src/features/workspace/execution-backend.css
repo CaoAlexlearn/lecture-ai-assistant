@@ -1,0 +1,4 @@
+.execution-backend { min-width: 0; display: grid; gap: 4px; }
+.execution-backend label { display: grid; gap: 4px; color: var(--ui-text); font-size: 0.75rem; }
+.execution-backend select { width: 100%; min-width: 0; max-width: 240px; min-height: 30px; border: 1px solid var(--ui-border-strong); border-radius: 7px; padding: 4px 6px; background: var(--ui-surface); color: var(--ui-accent-ink); font: inherit; }
+.execution-backend small { color: var(--ui-muted); font-size: 0.75rem; overflow-wrap: anywhere; }

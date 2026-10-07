@@ -1,0 +1,44 @@
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+# Classroom content and run history
+courses/
+data/
+runtime/
+tmp/
+evaluation/
+references/
+mineru_*/
+agent_lab/test_runs/
+agent_lab/agents/*/agent.json
+agent_lab/agents/*/prompts/v*.md
+!agent_lab/agents/*/prompts/v1.md
+instructions/*/
+instructions/*.md
+!instructions/faculty.md
+!instructions/user.md
+*.pdf
+*.ppt
+*.pptx
+*.docx
+*.wav
+*.mp3
+*.m4a
+*.mp4
+*.webm
+*.log
+# Dependencies and generated files
+.venv/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+.DS_Store
+frontend/node_modules/
+frontend/dist/
+frontend/.tsbuild/

@@ -1,0 +1,333 @@
+.lecture-workspace-page { height: 100vh; height: 100dvh; overflow: hidden; display: grid; grid-template-rows: auto auto minmax(0, 1fr); background: var(--ui-bg); }
+.workspace-reading-toolbar { min-width: 0; min-height: 28px; padding: 1px 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--ui-surface); border-bottom: 1px solid var(--ui-border); }
+.workspace-reading-heading { min-width: 0; }
+.workspace-reading-heading h1 { margin: 0; color: var(--ui-ink); font-size: .875rem; font-weight: 650; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-reading-heading > span { display: block; margin-top: 2px; color: var(--ui-muted); font-size: .75rem; }
+.workspace-reading-actions { flex-shrink: 0; display: flex; align-items: center; gap: 6px; }
+.workspace-reading-actions > button, .workspace-reading-actions > a { min-height: 24px; padding: 0 8px; display: inline-flex; align-items: center; gap: 5px; color: var(--ui-muted); background: transparent; border: 1px solid transparent; border-radius: 6px; font-size: .75rem; text-decoration: none; white-space: nowrap; }
+.workspace-reading-actions > button:hover, .workspace-reading-actions > a:hover { color: var(--ui-accent-ink); background: var(--ui-accent-soft); }
+.workspace-reading-actions > button[aria-pressed="true"] { color: var(--ui-accent-ink); border-color: var(--ui-border); background: var(--ui-surface-soft); }
+.workspace-reading-actions svg { width: 17px; height: 17px; }
+.workspace-mobile-tabs { display: none; }
+.lecture-workspace-body { min-width: 0; min-height: 0; padding: 8px; display: grid; grid-template-columns: minmax(0, var(--workspace-tree-width)) var(--workspace-tree-divider) minmax(360px, 1fr) var(--workspace-detail-divider) minmax(0, var(--workspace-detail-width)); grid-template-rows: minmax(260px, 1fr) 8px 34px; gap: 0; overflow: hidden; }
+.lecture-workspace-body.has-expanded-live { grid-template-rows: minmax(260px, 1fr) 8px minmax(180px, var(--workspace-live-height)); }
+.workspace-tree-panel { grid-column: 1; grid-row: 1 / 4; min-width: 0; min-height: 0; }
+.lecture-workspace-body > .pdf-pane { grid-column: 3; grid-row: 1; }
+.workspace-detail-panel { grid-column: 5; grid-row: 1 / 4; min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-rows: auto minmax(0, 1fr); background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 10px; }
+.workspace-live-panel { grid-column: 3; grid-row: 3; min-width: 0; min-height: 0; }
+.workspace-tree-panel > .knowledge-tree { height: 100%; border-radius: 10px; box-shadow: none; }
+.workspace-detail-tabs { min-width: 0; min-height: 46px; padding: 0 10px; display: flex; align-items: center; gap: 2px; border-bottom: 1px solid var(--ui-border); }
+.workspace-detail-tabs > [role="tab"] { min-height: 44px; padding: 0 10px; color: var(--ui-muted); background: transparent; border: 0; border-bottom: 2px solid transparent; font-size: .8125rem; font-weight: 600; white-space: nowrap; }
+.workspace-detail-tabs > [aria-selected="true"] { color: var(--ui-accent-ink); border-bottom-color: var(--ui-accent); }
+.workspace-pane-close { width: 32px; height: 32px; padding: 0; flex-shrink: 0; display: grid; place-items: center; color: var(--ui-muted); background: transparent; border: 0; border-radius: 6px; }
+.workspace-pane-close:hover { color: var(--ui-accent); background: var(--ui-accent-soft); }
+.workspace-pane-close svg { width: 16px; height: 16px; }
+.workspace-detail-tabs > .workspace-pane-close { margin-left: auto; }
+.workspace-detail-content, .workspace-notes-content { min-width: 0; min-height: 0; overflow: hidden; }
+.workspace-detail-content[hidden], .workspace-notes-content[hidden] { display: none; }
+.workspace-detail-content > .knowledge-inspector { height: 100%; border: 0; border-radius: 0; box-shadow: none; }
+.workspace-notes-content { overflow-y: auto; }
+.workspace-notes-content .classroom-enrichment { padding: 16px; }
+.workspace-content-state { padding: 20px; color: var(--ui-muted); font-size: .875rem; line-height: 1.7; }
+.workspace-content-state h2 { margin: 0 0 8px; color: var(--ui-ink); font-size: 1rem; }
+.lecture-workspace-body.is-tree-hidden > .workspace-tree-panel, .lecture-workspace-body.is-detail-hidden > .workspace-detail-panel, .lecture-workspace-body.is-pdf-expanded > .workspace-tree-panel, .lecture-workspace-body.is-pdf-expanded > .workspace-detail-panel { display: none; }
+.pdf-pane { min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; background: #eaf0f3; border: 1px solid var(--ui-border); border-radius: 8px; }
+.workspace-resizer { position: relative; z-index: 5; width: 100%; height: 100%; padding: 0; display: block; touch-action: none; background: transparent; border: 0; }
+.workspace-resizer::after { position: absolute; content: ""; background: var(--ui-border-strong); border-radius: 999px; opacity: .55; }
+.workspace-resizer:hover::after, .workspace-resizer:focus-visible::after { background: var(--ui-accent); opacity: 1; }
+.workspace-resizer--tree { grid-column: 2; grid-row: 1 / 4; cursor: col-resize; }
+.workspace-resizer--detail { grid-column: 4; grid-row: 1 / 4; cursor: col-resize; }
+.workspace-resizer--tree::after, .workspace-resizer--detail::after { inset: 18px 3px; width: 2px; }
+.workspace-resizer--live { grid-column: 3; grid-row: 2; cursor: row-resize; }
+.workspace-resizer--live::after { inset: 3px 18px; height: 2px; }
+body.is-resizing-workspace { cursor: grabbing; user-select: none; }
+.workspace-live-panel .live-class-dock { border-radius: 6px; grid-template-rows: 34px minmax(0, 1fr); box-shadow: none; }
+.workspace-live-panel .live-class-dock__bar { height: 34px; padding: 3px 10px; gap: 8px; }
+.workspace-live-panel .live-class-dock__toggle { min-height: 26px; }
+.workspace-live-panel .live-class-dock__toggle small { display: none; }
+.workspace-live-panel .live-class-dock__action { min-width: 0; height: 26px; min-height: 26px; padding: 0 10px; border-radius: 6px; font-size: .75rem; white-space: nowrap; }
+.workspace-live-panel .live-class-dock__toggle strong { font-size: .8125rem; }
+.workspace-live-panel .live-class-dock__postclass-button { min-height: 26px; padding-inline: 8px; border-radius: 6px; font-size: .75rem; }
+.workspace-live-panel .live-class-panel-heading { display: none; }
+.workspace-live-panel .live-class-stream-block__label { min-height: 26px; padding: 4px 12px; border-bottom: 0; }
+.workspace-live-panel .live-class-stream-block__scroll { padding: 6px 12px 12px; }
+.workspace-live-panel .live-class-stream-block p { line-height: 1.65; }
+.workspace-live-panel .live-class-dock__facts { gap: 8px; font-size: .75rem; }
+@media (max-width: 1400px) { .workspace-live-panel .live-class-dock__facts > span { display: none; } }
+.pdf-pane.has-notice { grid-template-rows: auto auto minmax(0, 1fr) auto; }
+
+.pdf-pane__header {
+  min-height: 48px;
+  padding: 7px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #e7ebe7;
+  background: var(--ui-pdf-toolbar);
+  border-bottom: 1px solid rgb(255 255 255 / 8%);
+}
+
+.pdf-pane__header > div { min-width: 0; display: grid; gap: 4px; }
+.pdf-pane__header span { color: #9eaaa5; font-size: 0.75rem; font-weight: 760; letter-spacing: .12em; text-transform: uppercase; }
+.pdf-pane__header strong { overflow: hidden; font-size: 0.76rem; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+
+.pdf-pane__header > .pdf-pane__actions { flex: 0 0 auto; display: flex; align-items: center; gap: 5px; }
+
+.pdf-upload,
+.pdf-expand {
+  flex: 0 0 auto;
+  height: 30px;
+  padding: 0 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #e6ebe7;
+  background: rgb(255 255 255 / 7%);
+  border: 1px solid rgb(255 255 255 / 12%);
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.75rem;
+  font-weight: 680;
+}
+
+.pdf-expand { appearance: none; }
+.pdf-upload:hover,
+.pdf-expand:hover { background: rgb(255 255 255 / 12%); }
+.pdf-upload input { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; }
+.pdf-upload svg,
+.pdf-expand svg { width: 15px; height: 15px; }
+
+.pdf-pane__notice {
+  margin: 0;
+  padding: 9px 13px;
+  color: #d8cdb9;
+  background: #524b3d;
+  border-bottom: 1px solid rgb(255 255 255 / 7%);
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+
+.pdf-pane__viewer { min-height: 0; padding: 4px; overflow: hidden; }
+
+.pdf-canvas-stage {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  background: #eaf0f3;
+  border-radius: 6px;
+  cursor: default;
+  touch-action: none;
+  user-select: none;
+}
+
+.pdf-canvas-stage.is-zoomed { cursor: grab; }
+.pdf-canvas-stage.is-zoomed:active { cursor: grabbing; }
+
+.pdf-canvas-transform {
+  display: grid;
+  place-items: center;
+  transform-origin: center center;
+  will-change: transform;
+}
+
+.pdf-canvas-transform canvas {
+  display: block;
+  background: #fff;
+  box-shadow: 0 2px 10px rgb(24 44 61 / 12%);
+  pointer-events: none;
+}
+
+.pdf-canvas-state {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #b6c0bb;
+  background: rgb(37 41 39 / 76%);
+  font-size: 0.75rem;
+  font-weight: 650;
+  letter-spacing: .025em;
+}
+
+.pdf-canvas-state.has-error { padding: 24px; color: #ead0c5; text-align: center; }
+
+.pdf-zoom-controls {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  z-index: 2;
+  height: 34px;
+  padding: 3px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  color: #e2e7e4;
+  background: rgb(43 49 46 / 88%);
+  border: 1px solid rgb(255 255 255 / 12%);
+  border-radius: 9px;
+  box-shadow: 0 6px 18px rgb(0 0 0 / 22%);
+  backdrop-filter: blur(8px);
+}
+
+.pdf-zoom-controls button {
+  min-width: 27px;
+  height: 26px;
+  padding: 0 7px;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+
+.pdf-zoom-controls button:hover:not(:disabled) { background: rgb(255 255 255 / 10%); }
+.pdf-zoom-controls button:disabled { cursor: default; opacity: .32; }
+.pdf-zoom-controls output { min-width: 42px; color: #b8c2bd; text-align: center; font-size: 0.75rem; font-variant-numeric: tabular-nums; }
+.pdf-zoom-controls .pdf-zoom-fit { padding-inline: 8px; color: #d1d8d4; font-size: 0.75rem; font-weight: 680; }
+
+.pdf-empty {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  color: var(--ui-text);
+  cursor: pointer;
+  text-align: center;
+  border: 1px dashed var(--ui-border-strong);
+  border-radius: 8px;
+}
+
+.pdf-empty > span { width: 52px; height: 64px; margin-bottom: 16px; display: grid; place-items: center; color: var(--ui-accent-ink); border: 1px solid var(--ui-border-strong); border-radius: 5px; font-size: 0.75rem; font-weight: 780; }
+.pdf-empty strong { font-size: 0.83rem; }
+.pdf-empty small { margin-top: 6px; color: var(--ui-muted); font-size: 0.75rem; }
+
+.pdf-pane__footer {
+  min-height: 40px;
+  padding: 5px 8px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #cad1cd;
+  background: var(--ui-pdf-toolbar);
+  border-top: 1px solid rgb(255 255 255 / 8%);
+}
+
+.pdf-pane__footer button { width: 30px; height: 30px; color: #dce2df; background: rgb(255 255 255 / 6%); border: 1px solid rgb(255 255 255 / 11%); border-radius: 7px; cursor: pointer; }
+.pdf-pane__footer button:hover:not(:disabled) { background: rgb(255 255 255 / 12%); }
+.pdf-pane__footer button:disabled { cursor: default; opacity: .35; }
+.pdf-pane__footer > span { min-width: 64px; text-align: center; font-size: 0.75rem; }
+.pdf-pane__footer > small { margin-left: auto; color: var(--ui-muted); font-size: 0.75rem; }
+
+@media (max-width: 1180px) {
+  .pdf-pane__footer > small { display: none; }
+}
+
+
+/* Keep the reading tools quiet; content owns the space. */
+.pdf-pane__header { min-height: 36px; padding: 3px 10px; }
+.pdf-pane__header span { color: #bdd0de; font-size: .75rem; font-weight: 500; letter-spacing: 0; text-transform: none; }
+.pdf-pane__header strong { font-size: .8125rem; }
+.pdf-upload, .pdf-expand { min-height: 28px; height: auto; font-weight: 600; }
+.pdf-pane__footer { min-height: 34px; padding: 2px 8px; }
+.pdf-pane__footer > small { color: #bfd0dc; font-size: .75rem; }
+.pdf-pane__footer button { width: 28px; height: 28px; }
+.pdf-pane__footer > span { font-size: .8125rem; }
+.pdf-zoom-controls { height: 32px; right: 8px; bottom: 8px; }
+.pdf-zoom-controls button { height: 26px; min-width: 28px; }
+.pdf-zoom-controls output { color: #d5e2e9; font-size: .75rem; }
+.knowledge-tree--compact .knowledge-tree__header { padding: 14px 12px 12px; }
+.knowledge-tree--compact .knowledge-tree__title { display: flex; align-items: flex-start; justify-content: space-between; gap: 4px; }
+.knowledge-tree--compact .knowledge-tree__title > div { min-width: 0; }
+.knowledge-tree--compact .knowledge-panel__eyebrow { display: none; }
+.knowledge-tree--compact .knowledge-tree__header h1 { margin: 3px 0; font-size: .9375rem; font-weight: 650; letter-spacing: -.02em; }
+.knowledge-tree--compact .knowledge-tree__header p { display: none; }
+.knowledge-tree--compact .knowledge-tree__controls { margin-top: 10px; gap: 4px; }
+.knowledge-tree--compact .knowledge-tree__controls button { padding: 4px 7px; min-height: 30px; border-color: transparent; font-size: .75rem; }
+.knowledge-tree--compact .knowledge-tree__scroll { padding: 10px 6px 18px; }
+.knowledge-tree--compact .knowledge-tree__children { margin-left: 9px; padding-left: 7px; }
+.knowledge-tree--compact .knowledge-tree__children > .knowledge-tree__item::before { left: -7px; width: 5px; top: 23px; }
+.knowledge-tree--compact .knowledge-tree__toggle, .knowledge-tree--compact .knowledge-tree__leaf { flex-basis: 20px; height: 36px; }
+.knowledge-tree--compact .knowledge-tree__leaf::after { left: 8px; }
+.knowledge-tree--compact .knowledge-tree__select { padding: 7px 7px 7px 0; gap: 4px; }
+.knowledge-tree--compact .knowledge-tree__select strong { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; font-size: .8125rem; font-weight: 550; line-height: 1.5; }
+.knowledge-tree--compact .is-root .knowledge-tree__select strong { font-size: .8125rem; font-weight: 650; }
+.knowledge-tree--compact .knowledge-tree__type { display: none; }
+.knowledge-tree--compact .knowledge-tree__meta small { font-size: .75rem; }
+.knowledge-tree--compact .knowledge-tree__footer { padding: 10px 12px; }
+.workspace-detail-panel .knowledge-inspector__header, .workspace-detail-panel .knowledge-inspector__section { padding: 16px; }
+.workspace-detail-panel .knowledge-inspector__header > .knowledge-panel__eyebrow { display: none; }
+.workspace-detail-panel .knowledge-inspector__header h1 { margin: 0 0 12px; font-size: 1.125rem; font-weight: 650; line-height: 1.5; letter-spacing: -.025em; }
+.workspace-detail-panel .knowledge-inspector__identity code { display: none; }
+.workspace-detail-panel .knowledge-inspector__scope { margin-top: 16px; padding: 10px 12px; }
+.workspace-detail-panel .knowledge-inspector__scope strong, .workspace-detail-panel .knowledge-inspector__header-sources > strong { font-size: .75rem; font-weight: 650; }
+.workspace-detail-panel .knowledge-inspector__section h2 { font-weight: 650; }
+.workspace-detail-panel .knowledge-inspector__comparison { grid-template-columns: minmax(0, 1fr); }
+@media (max-width: 1100px) {
+  .lecture-workspace-page { height: 100dvh; overflow: hidden; grid-template-rows: auto auto auto minmax(0, 1fr); }
+  .workspace-mobile-tabs { padding: 0 16px; display: flex; gap: 8px; background: var(--ui-surface); border-bottom: 1px solid var(--ui-border); }
+  .workspace-mobile-tabs button { min-height: 44px; flex: 1; color: var(--ui-muted); background: transparent; border: 0; border-bottom: 2px solid transparent; font-size: .875rem; }
+  .workspace-mobile-tabs button[aria-selected="true"] { color: var(--ui-accent-ink); border-bottom-color: var(--ui-accent); font-weight: 650; }
+  .workspace-reading-actions > .workspace-pane-toggle, .workspace-pane-close, .workspace-resizer { display: none; }
+  .lecture-workspace-body, .lecture-workspace-body.has-expanded-live { min-height: 0; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) 52px; padding: 8px; gap: 8px; }
+  .lecture-workspace-body > .workspace-tree-panel, .lecture-workspace-body > .pdf-pane, .lecture-workspace-body > .workspace-detail-panel { display: none; grid-column: 1; grid-row: 1; }
+  .lecture-workspace-body.view-pdf > .pdf-pane, .lecture-workspace-body.view-tree > .workspace-tree-panel { display: grid; }
+  .lecture-workspace-body.view-notes > .workspace-detail-panel { display: grid; }
+  .lecture-workspace-body > .workspace-live-panel { grid-column: 1; grid-row: 2; }
+  .lecture-workspace-body.view-live { grid-template-rows: minmax(0, 1fr); }
+  .lecture-workspace-body.view-live > .workspace-live-panel { grid-row: 1; }
+  .workspace-live-panel .live-class-dock { grid-template-rows: 52px minmax(0, 1fr); }
+  .workspace-live-panel .live-class-dock__bar { height: 52px; }
+  .workspace-live-panel .live-class-dock__toggle, .workspace-live-panel .live-class-dock__action, .workspace-live-panel .live-class-dock__postclass-button { min-height: 44px; }
+  .workspace-detail-panel .knowledge-inspector__comparison { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+  .knowledge-tree--compact .knowledge-tree__controls button { min-height: 36px; }
+  .knowledge-tree--compact .knowledge-tree__select { min-height: 44px; }
+}
+@media (max-width: 700px) {
+  .workspace-reading-toolbar { padding: 2px 12px; align-items: center; gap: 8px; }
+  .workspace-reading-heading h1 { max-width: 240px; font-size: .9375rem; white-space: normal; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+  .workspace-reading-heading > span { display: none; }
+  .workspace-reading-actions > a { min-height: 40px; padding-inline: 4px; font-size: .75rem; }
+  .workspace-mobile-tabs { padding-inline: 12px; }
+  .lecture-workspace-body, .lecture-workspace-body.has-expanded-live { grid-template-rows: minmax(0, 1fr) 100px; padding: 8px; gap: 8px; }
+  .lecture-workspace-body.view-live { grid-template-rows: minmax(0, 1fr); }
+  .workspace-live-panel .live-class-dock { grid-template-rows: 100px minmax(0, 1fr); }
+  .workspace-live-panel .live-class-dock__bar { height: 100px; flex-wrap: wrap; align-content: center; gap: 4px 8px; padding: 4px 10px; }
+  .workspace-live-panel .live-class-dock__toggle { flex: 1 1 calc(100% - 90px); }
+  .workspace-live-panel .live-class-dock__facts { flex: 0 0 auto; }
+  .workspace-live-panel .live-class-dock__action, .workspace-live-panel .live-class-dock__postclass-button { min-height: 44px; }
+  .workspace-live-panel .live-class-stream-block { min-height: 140px; }
+  .workspace-detail-panel .knowledge-inspector__section p, .workspace-detail-panel .knowledge-inspector__scope p, .workspace-detail-panel .knowledge-inspector__examples { font-size: 1rem; }
+  .knowledge-tree--compact .knowledge-tree__controls button { min-height: 44px; }
+  .pdf-pane__header { padding-inline: 10px; flex-wrap: wrap; gap: 6px; }
+  .pdf-pane__header > div:first-child { flex: 1 1 100px; }
+  .pdf-upload, .pdf-expand { min-height: 36px; }
+  .pdf-pane__footer button { width: 36px; height: 36px; }
+  .pdf-zoom-controls { height: 40px; }
+  .pdf-zoom-controls button { height: 34px; min-width: 34px; }
+  .pdf-upload svg, .pdf-expand svg { display: none; }
+}
+
+/* Review gives the notebook the central reading area; slide sources open beside it. */
+.workspace-detail-panel .reading-document__body { width: min(100%, 760px); }
+.workspace-detail-panel .reading-document .knowledge-inspector__header { padding: 0 0 24px; }
+.workspace-detail-panel .reading-document .knowledge-inspector__header h1 { font-size: clamp(1.3rem, 4cqi, 1.9rem); line-height: 1.35; }
+.workspace-detail-panel .reading-document .knowledge-inspector__section { padding: 0; margin-bottom: 28px; border-bottom: 0; }
+.workspace-detail-panel .reading-document .knowledge-inspector__section p, .workspace-detail-panel .reading-document .knowledge-inspector__examples { font-size: 1rem; line-height: 1.75; }
+.workspace-detail-panel .reading-document .knowledge-inspector__section h2 { font-size: 1.05rem; font-weight: 650; letter-spacing: 0; }
+.workspace-notes-content > .classroom-enrichment { width: min(100%, 760px); margin-inline: auto; padding: 28px clamp(18px, 3vw, 40px) 48px; border: 0; }
+@media (min-width: 1101px) {
+  .is-review-mode .lecture-workspace-body:not(.is-pdf-expanded) { grid-template-columns: minmax(0, var(--workspace-tree-width)) var(--workspace-tree-divider) minmax(0, 1fr) var(--workspace-detail-divider) minmax(0, var(--workspace-detail-width)); }
+  .is-review-mode .lecture-workspace-body:not(.is-pdf-expanded) > .workspace-detail-panel { grid-column: 3; grid-row: 1; display: grid; }
+  .is-review-mode .lecture-workspace-body:not(.is-pdf-expanded) > .pdf-pane { grid-column: 5; grid-row: 1 / 4; }
+  .is-review-mode .lecture-workspace-body.is-detail-hidden:not(.is-pdf-expanded) > .pdf-pane { display: none; }
+}
+@media (max-width: 1100px) {
+  .is-review-mode .lecture-workspace-body.view-notes > .workspace-detail-panel { display: grid; }
+}
+.lecture-workspace-body.is-pdf-expanded > .pdf-pane { grid-column: 1 / -1; grid-row: 1; }
